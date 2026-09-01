@@ -17,6 +17,11 @@ const state = {
   resolution: "720p",
   fps: "45",
   qualityPrompted: false,
+  sounds: {
+    join: localStorage.getItem("lonely-cord-sound-join") !== "off",
+    leave: localStorage.getItem("lonely-cord-sound-leave") !== "off",
+    notification: localStorage.getItem("lonely-cord-sound-notification") !== "off",
+  },
   draft: "",
   messages: [],
   remoteParticipants: [],
@@ -41,6 +46,7 @@ function icon(name, size = 20) {
     leave: '<path d="M8 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3M15 16l4-4-4-4M19 12H8"/>',
     chat: '<path d="M20 11.5a7.5 7.5 0 0 1-8 7.5 8.5 8.5 0 0 1-4-.9L4 20l1.3-3.6A7.2 7.2 0 0 1 4 12c0-4.1 3.6-7.5 8-7.5s8 3.1 8 7Z"/><path d="M8 12h.01M12 12h.01M16 12h.01"/>',
     send: '<path d="m21 3-7.2 18-3.5-7.3L3 10.2z"/><path d="M10.3 13.7 21 3"/>',
+    copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"/>',
     settings: '<path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"/><path d="m19.4 15 .1.1a1.8 1.8 0 0 1-2.5 2.5l-.1-.1a1.8 1.8 0 0 0-3.1 1.3v.2a1.8 1.8 0 0 1-3.6 0v-.2a1.8 1.8 0 0 0-3.1-1.3l-.1.1a1.8 1.8 0 0 1-2.5-2.5l.1-.1A1.8 1.8 0 0 0 3.4 12a1.8 1.8 0 0 0 1.2-3l-.1-.1A1.8 1.8 0 0 1 7 6.4l.1.1A1.8 1.8 0 0 0 10.2 5v-.2a1.8 1.8 0 0 1 3.6 0V5a1.8 1.8 0 0 0 3.1 1.5l.1-.1a1.8 1.8 0 0 1 2.5 2.5l-.1.1A1.8 1.8 0 0 0 20.6 12a1.8 1.8 0 0 0-1.2 3Z"/>',
     network: '<path d="M4.5 9.5a11 11 0 0 1 15 0M7.5 13a6.8 6.8 0 0 1 9 0M10.5 16.5a2.6 2.6 0 0 1 3 0M12 21h.01"/>',
     close: '<path d="m6 6 12 12M18 6 6 18"/>',
@@ -99,21 +105,25 @@ function api(path, body, keepalive = false) {
 }
 
 function playPresenceSound(kind) {
-  if (!window.AudioContext) return;
-  const context = new AudioContext();
-  const oscillator = context.createOscillator();
-  const gain = context.createGain();
-  const entering = kind === "join";
-  oscillator.type = "sine";
-  oscillator.frequency.setValueAtTime(entering ? 620 : 460, context.currentTime);
-  oscillator.frequency.exponentialRampToValueAtTime(entering ? 880 : 300, context.currentTime + 0.16);
-  gain.gain.setValueAtTime(0.0001, context.currentTime);
-  gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.22);
-  oscillator.connect(gain).connect(context.destination);
-  oscillator.start();
-  oscillator.stop(context.currentTime + 0.24);
-  oscillator.addEventListener("ended", () => context.close().catch(() => undefined), { once: true });
+  if (!state.sounds[kind]) return;
+  const audio = new Audio(`/sounds/${kind}.mp3`);
+  audio.volume = 0.55;
+  audio.play().catch(() => undefined);
+}
+
+function persistSoundPreference(kind, enabled) {
+  state.sounds[kind] = enabled;
+  localStorage.setItem(`lonely-cord-sound-${kind}`, enabled ? "on" : "off");
+}
+
+function syncMediaState() {
+  if (!state.joined) return;
+  api("/api/room/media", {
+    sessionId: state.sessionId,
+    micOn: state.micOn,
+    cameraOn: state.cameraOn,
+    sharing: Boolean(state.shareStream),
+  }).catch(() => undefined);
 }
 
 function connectRoom() {
@@ -133,6 +143,12 @@ function connectRoom() {
     playPresenceSound("join");
     updateRoom();
   });
+  source.addEventListener("participant-updated", (event) => {
+    const participant = JSON.parse(event.data);
+    if (participant.id === state.sessionId) return;
+    state.remoteParticipants = [...state.remoteParticipants.filter((item) => item.id !== participant.id), participant];
+    updateRoom();
+  });
   source.addEventListener("participant-left", (event) => {
     const participant = JSON.parse(event.data);
     state.remoteParticipants = state.remoteParticipants.filter((item) => item.id !== participant.id);
@@ -142,6 +158,7 @@ function connectRoom() {
   source.addEventListener("chat-message", (event) => {
     const message = JSON.parse(event.data);
     if (!state.messages.some((item) => item.id === message.id)) state.messages.push(message);
+    playPresenceSound("notification");
     updateRoom();
   });
   source.onerror = () => {
@@ -154,9 +171,10 @@ async function rejoinRoom() {
   if (!state.joined || state.offline) return;
   try {
     const joined = await api("/api/room/join", { sessionId: state.sessionId, name: state.displayName, hasAvatar: Boolean(state.avatarUrl) });
-    state.remoteParticipants = joined.participants.filter((participant) => participant.id !== state.sessionId);
+      state.remoteParticipants = joined.participants.filter((participant) => participant.id !== state.sessionId);
     state.messages = joined.messages || state.messages;
     connectRoom();
+    syncMediaState();
     updateRoom();
   } catch { /* EventSource will retry while the browser is still online. */ }
 }
@@ -203,6 +221,7 @@ async function ensureMedia(activate = false, showQuality = false) {
     if (activate) {
       state.stream.getVideoTracks().forEach((track) => { track.enabled = true; });
       state.cameraOn = true;
+      syncMediaState();
       if (showQuality && !state.qualityPrompted) openQuality(true);
       updateRoom();
     }
@@ -213,6 +232,7 @@ async function ensureMedia(activate = false, showQuality = false) {
     if (activate && stream) {
       stream.getVideoTracks().forEach((track) => { track.enabled = true; });
       state.cameraOn = true;
+      syncMediaState();
       if (showQuality && !state.qualityPrompted) openQuality(true);
       updateRoom();
     }
@@ -230,6 +250,7 @@ async function ensureMedia(activate = false, showQuality = false) {
       state.micOn = activate;
       mediaPromise = null;
       updateRoom();
+      syncMediaState();
       if (showQuality && !state.qualityPrompted) openQuality(true);
       if (state.micOn) startAudioMonitor();
       return stream;
@@ -277,11 +298,13 @@ async function switchCamera() {
   }
 }
 
-function toggleMic() {
-  if (!state.stream) { showToast("Hãy cấp quyền microphone để bật micro."); return; }
+async function toggleMic() {
+  if (!state.stream) await ensureMedia(false, false);
+  if (!state.stream) return;
   state.micOn = !state.micOn;
   state.stream.getAudioTracks().forEach((track) => { track.enabled = state.micOn; });
   if (state.micOn) startAudioMonitor(); else stopAudioMonitor();
+  syncMediaState();
   updateRoom();
 }
 
@@ -289,10 +312,17 @@ async function toggleCamera() {
   if (state.cameraOn && state.stream) {
     state.stream.getVideoTracks().forEach((track) => { track.enabled = false; });
     state.cameraOn = false;
+    syncMediaState();
     updateRoom();
     return;
   }
-  await ensureMedia(true, true);
+  await ensureMedia(false, true);
+  if (state.stream) {
+    state.stream.getVideoTracks().forEach((track) => { track.enabled = true; });
+    state.cameraOn = true;
+    syncMediaState();
+    updateRoom();
+  }
 }
 
 async function toggleShare() {
@@ -300,15 +330,17 @@ async function toggleShare() {
     stopStream(state.shareStream);
     state.shareStream = null;
     state.shareFocus = false;
+    syncMediaState();
     updateRoom();
     return;
   }
   if (!navigator.mediaDevices?.getDisplayMedia) { showToast("Trình duyệt này không hỗ trợ chia sẻ màn hình."); return; }
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: { ...constraints() }, audio: false });
-    stream.getVideoTracks()[0].onended = () => { state.shareStream = null; state.shareFocus = false; updateRoom(); };
+    stream.getVideoTracks()[0].onended = () => { state.shareStream = null; state.shareFocus = false; syncMediaState(); updateRoom(); };
     state.shareStream = stream;
     if (!state.qualityPrompted) openQuality(true);
+    syncMediaState();
     updateRoom();
   } catch {
     showToast("Bạn đã hủy chia sẻ màn hình.");
@@ -359,18 +391,141 @@ function participantTileHtml() {
 }
 
 function remoteParticipantTileHtml(participant) {
+  const micStatus = participant.micOn ? `<span class="media-status live" title="Microphone đang bật">${icon("mic", 13)}</span>` : `<span class="media-status muted" title="Microphone đang tắt">${icon("mic", 13)}</span>`;
+  const cameraStatus = participant.cameraOn ? `<span class="media-status live" title="Camera đang bật">${icon("camera", 13)}</span>` : "";
+  const shareStatus = participant.sharing ? `<span class="media-status live" title="Đang chia sẻ màn hình">${icon("share", 13)}</span>` : "";
   return `<article class="participant-tile" data-participant-id="${escapeHtml(participant.id)}">
     <div class="avatar-stage"><div class="participant-avatar participant-avatar-large" style="background:#5865f2"><span>${escapeHtml(participant.initials || initials(participant.name))}</span></div></div>
-    <div class="tile-shade"></div><div class="tile-topline"><span class="local-pill" style="background:#404249">ĐANG TRONG PHÒNG</span><span class="tile-muted">${icon("mic", 13)}</span></div>
-    <div class="tile-label"><span>${escapeHtml(participant.name)}</span></div>
+    <div class="tile-shade"></div><div class="tile-topline"><span class="local-pill" style="background:#404249">ĐANG TRONG PHÒNG</span><div class="media-statuses">${micStatus}${cameraStatus}${shareStatus}</div></div>
+    <div class="tile-label"><span>${escapeHtml(participant.name)}</span>${participant.cameraOn ? '<span class="camera-live-dot"></span>' : ""}</div>
   </article>`;
 }
 
+const markdownCodeBlocks = new Map();
+let nextCodeBlockId = 0;
+
+function safeMarkdownUrl(url) {
+  const value = String(url || "").trim();
+  if (/^(https?:|mailto:)/i.test(value)) return escapeHtml(value);
+  return "#";
+}
+
+function highlightCode(code, language) {
+  const keywords = {
+    javascript: "as async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield",
+    typescript: "as async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield interface type public private protected readonly enum implements namespace",
+    python: "and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield",
+    ruby: "alias and begin break case class def defined do else elsif end ensure false for if in module next nil not or redo rescue retry return self super then true undef unless until when while yield",
+    go: "break default func interface select case defer go map struct chan else goto package switch const fallthrough if range type continue for import return var",
+    rust: "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while",
+    java: "abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new package private protected public return short static strictfp super switch synchronized this throw throws transient try void volatile while",
+    csharp: "abstract as base bool break byte case catch char checked class const continue decimal default delegate do double else enum event explicit extern false finally fixed float for foreach goto if implicit in int interface internal is lock long namespace new null object operator out override params private protected public readonly ref return sbyte sealed short sizeof stackalloc static string struct switch this throw true try typeof uint ulong unchecked unsafe ushort using virtual void volatile while",
+    php: "and or xor __FILE__ __LINE__ array as break case class const continue declare default die do echo else elseif empty enddeclare endfor endforeach endif endswitch endwhile eval exit extends final for foreach function global if include include_once instanceof insteadof interface isset list namespace new print private protected public require require_once return static switch throw trait try unset use var while yield",
+    sql: "select from where and or not insert into update delete create alter drop table join inner left right full outer on as group by order having limit offset union all distinct values set null is like between exists",
+  };
+  const aliases = { js: "javascript", jsx: "javascript", ts: "typescript", tsx: "typescript", py: "python", rb: "ruby", rs: "rust", cs: "csharp", html: "markup", xml: "markup", sh: "bash", shell: "bash", yml: "yaml", md: "markdown" };
+  const lang = aliases[language] || language || "text";
+  const keywordSet = new Set((keywords[lang] || "").split(/\s+/).filter(Boolean));
+  const pattern = /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*|<!--[\s\S]*?-->|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?=\s*\()|\b[A-Za-z_$][\w$]*\b/g;
+  let output = "";
+  let cursor = 0;
+  for (const match of code.matchAll(pattern)) {
+    const token = match[0];
+    const index = match.index ?? 0;
+    output += escapeHtml(code.slice(cursor, index));
+    const escaped = escapeHtml(token);
+    let type = "plain";
+    if (/^(\/\*|\/\/|#|<!--)/.test(token)) type = "comment";
+    else if (/^(["'`])/.test(token)) type = "string";
+    else if (/^\d/.test(token)) type = "number";
+    else if (match[0] && /\($/.test(code.slice(index + token.length, index + token.length + 1))) type = "function";
+    else if (keywordSet.has(token)) type = "keyword";
+    output += type === "plain" ? escaped : `<span class="tok-${type}">${escaped}</span>`;
+    cursor = index + token.length;
+  }
+  return output + escapeHtml(code.slice(cursor));
+}
+
+function codeBlockHtml(code, language) {
+  const id = `code-${nextCodeBlockId++}`;
+  markdownCodeBlocks.set(id, code);
+  const label = language || "text";
+  return `<div class="code-block"><div class="code-toolbar"><span class="code-language">${escapeHtml(label)}</span><button type="button" class="code-copy" data-code-id="${id}">${icon("copy", 14)}<span>Copy</span></button></div><pre><code class="language-${escapeHtml(label)}">${highlightCode(code, label)}</code></pre></div>`;
+}
+
+function renderInlineMarkdown(value) {
+  const placeholders = [];
+  let output = escapeHtml(value).replace(/`([^`\n]+)`/g, (_, code) => {
+    const id = placeholders.push(`<code class="inline-code">${code}</code>`) - 1;
+    return `\u0000${id}\u0000`;
+  });
+  output = output.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, label, url) => `<a href="${safeMarkdownUrl(url)}" target="_blank" rel="noreferrer">${label}</a>`);
+  output = output.replace(/\*\*([^*]+)\*\*|__([^_]+)__/g, (_, strong, underscored) => `<strong>${strong || underscored}</strong>`);
+  output = output.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  output = output.replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  output = output.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
+  return output.replace(/\u0000(\d+)\u0000/g, (_, id) => placeholders[Number(id)]);
+}
+
+function renderMarkdown(source) {
+  const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
+  const html = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+    const fence = line.match(/^ {0,3}```\s*([^\s`]*)\s*$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^ {0,3}```\s*$/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      html.push(codeBlockHtml(code.join("\n"), fence[1].toLowerCase()));
+      continue;
+    }
+    const heading = line.match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*$/);
+    if (heading) { html.push(`<h${heading[1].length}>${renderInlineMarkdown(heading[2])}</h${heading[1].length}>`); index += 1; continue; }
+    if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) { html.push("<hr>"); index += 1; continue; }
+    if (/^ {0,3}>\s?/.test(line)) {
+      const quote = [];
+      while (index < lines.length && /^ {0,3}>\s?/.test(lines[index])) quote.push(lines[index++].replace(/^ {0,3}>\s?/, ""));
+      html.push(`<blockquote>${renderMarkdown(quote.join("\n"))}</blockquote>`);
+      continue;
+    }
+    if (/^\s*(?:[-+*]|\d+\.)\s+/.test(line)) {
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      const listPattern = ordered ? /^\s*\d+\.\s+/ : /^\s*[-+*]\s+/;
+      const items = [];
+      while (index < lines.length && listPattern.test(lines[index])) {
+        items.push(lines[index++].replace(listPattern, ""));
+      }
+      html.push(`<${ordered ? "ol" : "ul"}>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</${ordered ? "ol" : "ul"}>`);
+      continue;
+    }
+    if (line.includes("|") && index + 1 < lines.length && /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1])) {
+      const cells = (value) => value.replace(/^\s*\||\|\s*$/g, "").split("|").map((cell) => renderInlineMarkdown(cell.trim()));
+      const headers = cells(line);
+      index += 2;
+      const rows = [];
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) rows.push(cells(lines[index++]));
+      html.push(`<table><thead><tr>${headers.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+      continue;
+    }
+    const paragraph = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^ {0,3}(#{1,6})\s+/.test(lines[index]) && !/^ {0,3}```/.test(lines[index]) && !/^\s*(?:[-+*]|\d+\.)\s+/.test(lines[index]) && !/^ {0,3}>/.test(lines[index])) paragraph.push(lines[index++]);
+    html.push(`<p>${paragraph.map(renderInlineMarkdown).join("<br>")}</p>`);
+  }
+  return html.join("");
+}
+
 function chatHtml() {
+  markdownCodeBlocks.clear();
+  nextCodeBlockId = 0;
   const messages = state.messages.length
-    ? state.messages.map((message) => `<div class="chat-message ${message.senderId === state.sessionId ? "local" : ""}"><div class="message-meta"><strong>${escapeHtml(message.name)}</strong><span>${escapeHtml(message.time)}</span></div><p>${escapeHtml(message.text)}</p></div>`).join("")
+    ? state.messages.map((message) => `<div class="chat-message ${message.senderId === state.sessionId ? "local" : ""}"><div class="message-meta"><strong>${escapeHtml(message.name)}</strong><span>${escapeHtml(message.time)}</span></div><div class="markdown-body">${renderMarkdown(message.text)}</div></div>`).join("")
     : `<div class="chat-empty">${icon("chat", 26)}<p>Chưa có tin nhắn nào.</p><span>Bắt đầu cuộc trò chuyện trong phòng duy nhất này.</span></div>`;
-  return `<aside class="chat-panel rise-in" aria-label="Trò chuyện trong phòng"><div class="panel-head"><div><span class="panel-kicker">PHÒNG CHAT</span><h2>Tin nhắn</h2></div><button class="icon-button subtle" id="close-chat" aria-label="Đóng chat">${icon("close", 19)}</button></div><div class="chat-list">${messages}</div><form class="chat-compose" id="chat-form"><input id="chat-input" value="${escapeHtml(state.draft)}" placeholder="Nhập tin nhắn..." aria-label="Tin nhắn"><button type="submit" aria-label="Gửi tin nhắn" ${state.draft.trim() ? "" : "disabled"}>${icon("send", 18)}</button></form></aside>`;
+  return `<aside class="chat-panel" aria-label="Trò chuyện trong phòng"><div class="panel-head"><div><span class="panel-kicker">PHÒNG CHAT</span><h2>Tin nhắn</h2></div><button class="icon-button subtle" id="close-chat" aria-label="Đóng chat">${icon("close", 19)}</button></div><div class="chat-list">${messages}</div><form class="chat-compose" id="chat-form"><textarea id="chat-input" rows="2" placeholder="Markdown được hỗ trợ..." aria-label="Tin nhắn">${escapeHtml(state.draft)}</textarea><button type="submit" aria-label="Gửi tin nhắn" ${state.draft.trim() ? "" : "disabled"}>${icon("send", 18)}</button></form></aside>`;
 }
 
 function shareTileHtml() {
@@ -397,7 +552,8 @@ function qualityHtml() {
   if (!state.qualityOpen) return "";
   const automatic = state.qualityOpen === "automatic";
   const meter = Math.min(96, Math.max(18, (heights[state.resolution] / 1080) * 100));
-  return `<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="quality-card rise-in"><div class="quality-head"><div><span class="panel-kicker">${automatic ? "THIẾT LẬP LẦN ĐẦU" : "CÀI ĐẶT MEDIA"}</span><h2>Chất lượng video</h2></div><button class="icon-button subtle" id="close-quality" aria-label="Đóng cài đặt chất lượng">${icon("close", 19)}</button></div>${automatic ? '<p class="quality-intro">Chọn chất lượng khởi đầu cho camera và chia sẻ màn hình. Bạn có thể thay đổi lại trong Cài đặt.</p>' : ""}<div class="quality-options"><div><label class="field-label" for="resolution">Độ phân giải</label><select id="resolution">${Object.keys(heights).map((item) => `<option value="${item}" ${state.resolution === item ? "selected" : ""}>${item}</option>`).join("")}</select></div><div><label class="field-label" for="fps">Tốc độ khung hình</label><select id="fps">${[15, 30, 45, 60].map((item) => `<option value="${item}" ${Number(state.fps) === item ? "selected" : ""}>${item} fps</option>`).join("")}</select></div></div><div class="quality-meter"><span>Đang chọn</span><strong>${state.resolution} · ${state.fps} fps</strong><div class="meter-track"><span style="width:${meter}%"></span></div></div><button class="primary-action" id="apply-quality"><span>${automatic ? "Tiếp tục" : "Lưu cài đặt"}</span>${icon("arrow", 17)}</button></div></div>`;
+  const soundOption = (kind, title, description) => `<label class="sound-toggle"><span><strong>${title}</strong><small>${description}</small></span><input type="checkbox" data-sound-toggle="${kind}" ${state.sounds[kind] ? "checked" : ""}><i aria-hidden="true"></i></label>`;
+  return `<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="quality-card rise-in"><div class="quality-head"><div><span class="panel-kicker">${automatic ? "THIẾT LẬP LẦN ĐẦU" : "CÀI ĐẶT MEDIA"}</span><h2>Chất lượng video</h2></div><button class="icon-button subtle" id="close-quality" aria-label="Đóng cài đặt chất lượng">${icon("close", 19)}</button></div>${automatic ? '<p class="quality-intro">Chọn chất lượng khởi đầu cho camera và chia sẻ màn hình. Bạn có thể thay đổi lại trong Cài đặt.</p>' : ""}<div class="quality-options"><div><label class="field-label" for="resolution">Độ phân giải</label><select id="resolution">${Object.keys(heights).map((item) => `<option value="${item}" ${state.resolution === item ? "selected" : ""}>${item}</option>`).join("")}</select></div><div><label class="field-label" for="fps">Tốc độ khung hình</label><select id="fps">${[15, 30, 45, 60].map((item) => `<option value="${item}" ${Number(state.fps) === item ? "selected" : ""}>${item} fps</option>`).join("")}</select></div></div><section class="sound-settings"><div class="sound-settings-head"><span class="panel-kicker">THÔNG BÁO ÂM THANH</span><small>Mỗi trình duyệt tự lưu lựa chọn này.</small></div>${soundOption("join", "Người vào phòng", "Phát khi có người tham gia")}${soundOption("leave", "Người rời phòng", "Phát khi có người rời đi")}${soundOption("notification", "Tin nhắn mới", "Phát khi có tin nhắn")}</section><div class="quality-meter"><span>Đang chọn</span><strong>${state.resolution} · ${state.fps} fps</strong><div class="meter-track"><span style="width:${meter}%"></span></div></div><button class="primary-action" id="apply-quality"><span>${automatic ? "Tiếp tục" : "Lưu cài đặt"}</span>${icon("arrow", 17)}</button></div></div>`;
 }
 
 function shareFocusHtml() {
@@ -484,11 +640,51 @@ function bindRoom() {
   document.querySelector("#close-quality")?.addEventListener("click", closeQuality);
   document.querySelector("#resolution")?.addEventListener("change", (event) => { state.resolution = event.target.value; render(); });
   document.querySelector("#fps")?.addEventListener("change", (event) => { state.fps = event.target.value; render(); });
+  document.querySelectorAll("[data-sound-toggle]").forEach((input) => {
+    input.addEventListener("change", (event) => persistSoundPreference(event.target.dataset.soundToggle, event.target.checked));
+  });
+  document.querySelectorAll(".code-copy").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const code = markdownCodeBlocks.get(button.dataset.codeId) || "";
+      try {
+        await navigator.clipboard.writeText(code);
+      } catch {
+        const helper = document.createElement("textarea");
+        helper.value = code;
+        helper.style.position = "fixed";
+        helper.style.opacity = "0";
+        document.body.appendChild(helper);
+        helper.select();
+        document.execCommand("copy");
+        helper.remove();
+      }
+      const label = button.querySelector("span");
+      if (label) {
+        label.textContent = "Đã copy";
+        window.setTimeout(() => { label.textContent = "Copy"; }, 1600);
+      }
+    });
+  });
   document.querySelector("#apply-quality")?.addEventListener("click", () => { applyQuality(); closeQuality(); });
 }
 
 function updateRoom() {
-  if (state.joined) { render(); bindVideos(); }
+  if (!state.joined) return;
+  const previousChatList = document.querySelector(".chat-list");
+  const previousInput = document.querySelector("#chat-input");
+  const keepChatAtBottom = previousChatList && previousChatList.scrollHeight - previousChatList.scrollTop - previousChatList.clientHeight < 24;
+  const previousScrollTop = previousChatList?.scrollTop || 0;
+  const keepInputFocus = document.activeElement === previousInput;
+  const caret = keepInputFocus ? previousInput.selectionStart : null;
+  render();
+  bindVideos();
+  const nextChatList = document.querySelector(".chat-list");
+  if (nextChatList) nextChatList.scrollTop = keepChatAtBottom ? nextChatList.scrollHeight : previousScrollTop;
+  if (keepInputFocus) {
+    const nextInput = document.querySelector("#chat-input");
+    nextInput?.focus();
+    if (caret !== null) nextInput.setSelectionRange(caret, caret);
+  }
 }
 
 function leaveRoom() {
@@ -530,7 +726,10 @@ window.addEventListener("offline", () => { state.offline = true; render(); });
 window.addEventListener("online", async () => { state.offline = false; render(); if (state.joined) await rejoinRoom(); });
 document.addEventListener("contextmenu", (event) => event.preventDefault());
 document.addEventListener("selectstart", (event) => { if (!["INPUT", "TEXTAREA"].includes(event.target.tagName)) event.preventDefault(); });
-document.addEventListener("copy", (event) => event.preventDefault());
+document.addEventListener("copy", (event) => {
+  if (event.target.closest?.(".code-block") || ["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
+  event.preventDefault();
+});
 document.addEventListener("keydown", (event) => {
   const devtoolsShortcut = event.key === "F12" || (event.ctrlKey && event.shiftKey && ["I", "J", "C"].includes(event.key.toUpperCase())) || (event.ctrlKey && event.key.toUpperCase() === "U");
   if (devtoolsShortcut) event.preventDefault();
