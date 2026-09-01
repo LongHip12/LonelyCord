@@ -20,6 +20,13 @@ const messages = [];
 const iceServers = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
+  ...(String(process.env.TURN_URLS || process.env.TURN_URL || "").split(",").map((url) => url.trim()).filter(Boolean).length
+    ? [{
+        urls: String(process.env.TURN_URLS || process.env.TURN_URL).split(",").map((url) => url.trim()).filter(Boolean),
+        username: process.env.TURN_USERNAME || "",
+        credential: process.env.TURN_CREDENTIAL || "",
+      }]
+    : []),
 ];
 
 function sendJson(response, status, body) {

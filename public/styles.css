@@ -121,6 +121,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .markdown-body ul, .markdown-body ol { margin: 7px 0; padding-left: 20px; } .markdown-body li { margin: 3px 0; }
 .markdown-body blockquote { margin: 8px 0; padding-left: 10px; border-left: 3px solid var(--brand); color: #d9dbe1; }
 .markdown-body a { color: #c7ccff; text-decoration: underline; } .markdown-body del { opacity: .8; }
+.markdown-body .spoiler { display: inline; padding: 0 3px; border-radius: 3px; background: #111214; color: transparent; cursor: pointer; user-select: none; transition: color .16s, background .16s; } .markdown-body .spoiler.revealed { background: rgba(88,101,242,.25); color: inherit; user-select: text; }
 .inline-code { padding: 2px 4px; border-radius: 3px; background: #18191c; color: #ffb8d0; font-family: "SFMono-Regular", Consolas, monospace; font-size: .92em; }
 .markdown-body hr { border: 0; border-top: 1px solid #555862; } .markdown-body table { width: 100%; margin: 8px 0; border-collapse: collapse; font-size: 11px; }
 .markdown-body th, .markdown-body td { padding: 5px 6px; border: 1px solid #555862; text-align: left; } .markdown-body th { background: rgba(17,18,20,.35); }

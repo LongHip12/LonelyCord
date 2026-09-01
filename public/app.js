@@ -1,5 +1,7 @@
 const app = document.querySelector("#app");
 const hljs = window.hljs;
+const markdownParser = window.marked?.marked;
+const sanitizeMarkdown = window.DOMPurify?.sanitize;
 
 const state = {
   joined: false,
@@ -40,6 +42,7 @@ let toastTimer = null;
 let audioMonitor = null;
 let speakingTimer = null;
 let eventsSource = null;
+let presenceAudioUnlocked = false;
 const peerConnections = new Map();
 const remoteStreams = new Map();
 const presenceAudio = new Map(
@@ -128,6 +131,19 @@ function playPresenceSound(kind) {
   audio.play().catch(() => undefined);
 }
 
+function unlockPresenceAudio() {
+  if (presenceAudioUnlocked) return;
+  presenceAudioUnlocked = true;
+  presenceAudio.forEach((audio) => {
+    audio.muted = true;
+    audio.play().then(() => {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.muted = false;
+    }).catch(() => { audio.muted = false; });
+  });
+}
+
 function persistSoundPreference(kind, enabled) {
   state.sounds[kind] = enabled;
   localStorage.setItem(`lonely-cord-sound-${kind}`, enabled ? "on" : "off");
@@ -154,20 +170,25 @@ function signalPeer(targetId, type, payload) {
 
 function desiredTracks() {
   return [
-    ...(state.stream?.getTracks() || []),
+    ...(state.stream?.getAudioTracks() || []),
+    ...(state.stream?.getVideoTracks() || []),
     ...(state.shareStream?.getTracks() || []),
   ];
 }
 
 function syncPeerTracks(peer) {
   const tracks = desiredTracks();
-  const senders = peer.pc.getSenders();
-  for (const sender of senders) {
-    if (sender.track && !tracks.includes(sender.track)) peer.pc.removeTrack(sender);
+  const desired = new Set(tracks);
+  for (const sender of peer.pc.getSenders()) {
+    if (sender.track && !desired.has(sender.track)) {
+      peer.pc.removeTrack(sender);
+      peer.localStream.removeTrack(sender.track);
+    }
   }
   for (const track of tracks) {
-    if (!senders.some((sender) => sender.track === track)) {
-      peer.pc.addTrack(track, new MediaStream([track]));
+    if (!peer.pc.getSenders().some((sender) => sender.track === track)) {
+      peer.localStream.addTrack(track);
+      peer.pc.addTrack(track, peer.localStream);
     }
   }
 }
@@ -182,6 +203,34 @@ function closePeer(remoteId) {
   remoteStreams.delete(remoteId);
 }
 
+async function negotiatePeer(peer) {
+  if (peer.negotiationInFlight) {
+    peer.negotiationQueued = true;
+    return;
+  }
+  if (peer.pc.signalingState !== "stable") {
+    peer.negotiationQueued = true;
+    return;
+  }
+  peer.negotiationInFlight = true;
+  peer.makingOffer = true;
+  try {
+    await peer.pc.setLocalDescription();
+    if (peer.pc.localDescription) {
+      await signalPeer(peer.remoteId, peer.pc.localDescription.type, peer.pc.localDescription);
+    }
+  } catch {
+    peer.negotiationQueued = true;
+  } finally {
+    peer.makingOffer = false;
+    peer.negotiationInFlight = false;
+    if (peer.negotiationQueued && peer.pc.signalingState === "stable") {
+      peer.negotiationQueued = false;
+      queueMicrotask(() => negotiatePeer(peer));
+    }
+  }
+}
+
 function createPeer(remoteId) {
   if (remoteId === state.sessionId || !window.RTCPeerConnection) return null;
   const existing = peerConnections.get(remoteId);
@@ -192,18 +241,27 @@ function createPeer(remoteId) {
   const pc = new RTCPeerConnection({ iceServers: state.iceServers });
   const peer = {
     pc,
+    remoteId,
+    localStream: new MediaStream(),
+    remoteStream: new MediaStream(),
     makingOffer: false,
     ignoreOffer: false,
     polite: state.sessionId > remoteId,
     pendingCandidates: [],
+    negotiationInFlight: false,
+    negotiationQueued: false,
   };
   peerConnections.set(remoteId, peer);
   pc.onicecandidate = (event) => {
     if (event.candidate) signalPeer(remoteId, "candidate", event.candidate);
   };
   pc.ontrack = (event) => {
-    const stream = event.streams[0] || remoteStreams.get(remoteId) || new MediaStream();
-    if (!event.streams[0]) stream.addTrack(event.track);
+    const stream = peer.remoteStream;
+    const tracks = event.streams[0]?.getTracks() || [event.track];
+    tracks.forEach((track) => {
+      if (!stream.getTracks().includes(track)) stream.addTrack(track);
+    });
+    if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
     remoteStreams.set(remoteId, stream);
     updateRoom();
   };
@@ -213,19 +271,7 @@ function createPeer(remoteId) {
       updateRoom();
     }
   };
-  pc.onnegotiationneeded = async () => {
-    try {
-      peer.makingOffer = true;
-      await pc.setLocalDescription();
-      if (pc.localDescription) {
-        await signalPeer(remoteId, pc.localDescription.type, pc.localDescription);
-      }
-    } catch {
-      return;
-    } finally {
-      peer.makingOffer = false;
-    }
-  };
+  pc.onnegotiationneeded = () => negotiatePeer(peer);
   syncPeerTracks(peer);
   return peer;
 }
@@ -236,12 +282,16 @@ async function handleRtcSignal(event) {
   if (!peer) return;
   const description = type === "candidate" ? null : payload;
   try {
+    if (type === "candidate" && peer.ignoreOffer) return;
     if (description) {
       const offerCollision =
         description.type === "offer" &&
         (peer.makingOffer || peer.pc.signalingState !== "stable");
       peer.ignoreOffer = !peer.polite && offerCollision;
       if (peer.ignoreOffer) return;
+      if (description.type === "offer" && peer.pc.signalingState !== "stable") {
+        await peer.pc.setLocalDescription({ type: "rollback" });
+      }
       await peer.pc.setRemoteDescription(description);
       for (const candidate of peer.pendingCandidates.splice(0)) {
         await peer.pc.addIceCandidate(candidate);
@@ -251,6 +301,10 @@ async function handleRtcSignal(event) {
         if (peer.pc.localDescription) {
           await signalPeer(fromId, peer.pc.localDescription.type, peer.pc.localDescription);
         }
+      }
+      if (peer.negotiationQueued && peer.pc.signalingState === "stable") {
+        peer.negotiationQueued = false;
+        negotiatePeer(peer);
       }
     } else if (payload) {
       if (peer.pc.remoteDescription) await peer.pc.addIceCandidate(payload);
@@ -363,7 +417,7 @@ async function ensureMedia(activate = false, showQuality = false) {
   if (state.stream) {
     if (activate) {
       state.stream.getVideoTracks().forEach((track) => { track.enabled = true; });
-      state.cameraOn = true;
+      state.cameraOn = state.stream.getVideoTracks().length > 0;
       syncMediaState();
       if (showQuality && !state.qualityPrompted) openQuality(true);
       updateRoom();
@@ -374,7 +428,7 @@ async function ensureMedia(activate = false, showQuality = false) {
     const stream = await mediaPromise;
     if (activate && stream) {
       stream.getVideoTracks().forEach((track) => { track.enabled = true; });
-      state.cameraOn = true;
+      state.cameraOn = stream.getVideoTracks().length > 0;
       syncMediaState();
       if (showQuality && !state.qualityPrompted) openQuality(true);
       updateRoom();
@@ -385,28 +439,43 @@ async function ensureMedia(activate = false, showQuality = false) {
     showToast("Trình duyệt này không hỗ trợ truy cập camera.");
     return null;
   }
-  mediaPromise = navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: state.facingMode }, audio: true })
-    .then((stream) => {
-      stream.getTracks().forEach((track) => { track.enabled = activate; });
-      state.stream = stream;
-      state.cameraOn = activate;
-      state.micOn = activate;
-      mediaPromise = null;
-      updateRoom();
-      syncMediaState();
-      state.remoteParticipants.forEach((participant) => {
-        const peer = createPeer(participant.id);
-        if (peer) syncPeerTracks(peer);
-      });
-      if (showQuality && !state.qualityPrompted) openQuality(true);
-      if (state.micOn) startAudioMonitor();
-      return stream;
-    })
+  mediaPromise = (async () => {
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: state.facingMode }, audio: true });
+    } catch {
+      const tracks = [];
+      try {
+        const audioOnly = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        tracks.push(...audioOnly.getAudioTracks());
+      } catch {}
+      try {
+        const videoOnly = await navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: state.facingMode }, audio: false });
+        tracks.push(...videoOnly.getVideoTracks());
+      } catch {}
+      if (!tracks.length) throw new Error("Media permission denied");
+      stream = new MediaStream(tracks);
+    }
+    stream.getTracks().forEach((track) => { track.enabled = activate; });
+    state.stream = stream;
+    state.cameraOn = activate && stream.getVideoTracks().length > 0;
+    state.micOn = activate && stream.getAudioTracks().length > 0;
+    mediaPromise = null;
+    updateRoom();
+    syncMediaState();
+    state.remoteParticipants.forEach((participant) => {
+      const peer = createPeer(participant.id);
+      if (peer) syncPeerTracks(peer);
+    });
+    if (showQuality && !state.qualityPrompted) openQuality(true);
+    if (state.micOn) startAudioMonitor();
+    return stream;
+  })()
     .catch(() => {
       mediaPromise = null;
       state.cameraOn = false;
       state.micOn = false;
-      showToast("Bạn chưa cấp quyền camera hoặc microphone. Bạn vẫn có thể vào phòng với media đang tắt.");
+      showToast("Không thể cấp quyền camera hoặc microphone. Bạn vẫn có thể vào phòng rồi thử lại trong Cài đặt trình duyệt.");
       return null;
     });
   return mediaPromise;
@@ -419,30 +488,67 @@ function stopStream(stream) {
 async function switchCamera() {
   const nextFacing = state.facingMode === "user" ? "environment" : "user";
   if (!navigator.mediaDevices?.getUserMedia) { showToast("Trình duyệt này không hỗ trợ đổi camera."); return; }
+  if (!state.stream) await ensureMedia(false, false);
+  const oldVideo = state.stream?.getVideoTracks()[0];
   try {
+    if (oldVideo) {
+      try {
+        await oldVideo.applyConstraints({ ...constraints(), facingMode: { ideal: nextFacing } });
+        const currentFacing = oldVideo.getSettings().facingMode;
+        if (!currentFacing || currentFacing === nextFacing) {
+          state.facingMode = nextFacing;
+          updateRoom();
+          return;
+        }
+      } catch {}
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+    const cameras = devices.filter((device) => device.kind === "videoinput");
+    const currentDeviceId = oldVideo?.getSettings().deviceId;
+    const facingPattern = nextFacing === "environment" ? /back|rear|environment|world/i : /front|user|facetime/i;
+    const nextDevice = cameras.find((device) => device.deviceId !== currentDeviceId && facingPattern.test(device.label))
+      || cameras.find((device) => device.deviceId !== currentDeviceId);
+    const video = nextDevice
+      ? { ...constraints(), deviceId: { exact: nextDevice.deviceId } }
+      : { ...constraints(), facingMode: { ideal: nextFacing } };
     let nextStream;
     try {
-      nextStream = await navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: { exact: nextFacing } }, audio: false });
+      nextStream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
     } catch {
-      nextStream = await navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: nextFacing }, audio: false });
+      nextStream = await navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: { ideal: nextFacing } }, audio: false });
     }
     const nextVideo = nextStream.getVideoTracks()[0];
     if (!nextVideo) throw new Error("No video track");
-    const oldVideo = state.stream?.getVideoTracks()[0];
     if (state.stream && oldVideo) {
-      state.stream.removeTrack(oldVideo);
-      oldVideo.stop();
-      nextVideo.enabled = state.cameraOn;
       state.stream.addTrack(nextVideo);
+      oldVideo.stop();
+      state.stream.removeTrack(oldVideo);
     } else {
-      state.stream = new MediaStream([nextVideo]);
-      nextVideo.enabled = false;
+      state.stream = new MediaStream([...(state.stream?.getAudioTracks() || []), nextVideo]);
     }
+    nextVideo.enabled = state.cameraOn;
     state.facingMode = nextFacing;
     peerConnections.forEach((peer) => syncPeerTracks(peer));
     updateRoom();
   } catch {
     showToast("Camera trước/sau không khả dụng trên thiết bị này.");
+  }
+}
+
+async function addVideoTrack() {
+  if (state.stream?.getVideoTracks().length) return true;
+  try {
+    const videoStream = await navigator.mediaDevices.getUserMedia({ video: { ...constraints(), facingMode: { ideal: state.facingMode } }, audio: false });
+    const videoTrack = videoStream.getVideoTracks()[0];
+    if (!videoTrack) throw new Error("No video track");
+    if (!state.stream) state.stream = new MediaStream();
+    videoTrack.enabled = state.cameraOn;
+    state.stream.addTrack(videoTrack);
+    peerConnections.forEach((peer) => syncPeerTracks(peer));
+    return true;
+  } catch {
+    showToast("Không thể mở camera. Hãy kiểm tra quyền camera trong trình duyệt.");
+    return false;
   }
 }
 
@@ -465,7 +571,7 @@ async function toggleCamera() {
     return;
   }
   await ensureMedia(false, true);
-  if (state.stream) {
+  if (state.stream && await addVideoTrack()) {
     state.stream.getVideoTracks().forEach((track) => { track.enabled = true; });
     state.cameraOn = true;
     syncMediaState();
@@ -643,14 +749,32 @@ function renderInlineMarkdown(value) {
     return `\u0000${id}\u0000`;
   });
   output = output.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, label, url) => `<a href="${safeMarkdownUrl(url)}" target="_blank" rel="noreferrer">${label}</a>`);
-  output = output.replace(/\*\*([^*]+)\*\*|__([^_]+)__/g, (_, strong, underscored) => `<strong>${strong || underscored}</strong>`);
-  output = output.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  output = output.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  output = output.replace(/__([^_]+)__/g, "<u>$1</u>");
+  output = output.replace(/~~([^~]+)~~|--([^-]+)--/g, (_, strike, dashed) => `<del>${strike || dashed}</del>`);
+  output = output.replace(/\|\|([^|]+)\|\|/g, '<span class="spoiler" tabindex="0" role="button" data-spoiler>$1</span>');
   output = output.replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   output = output.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
   return output.replace(/\u0000(\d+)\u0000/g, (_, id) => placeholders[Number(id)]);
 }
 
 function renderMarkdown(source) {
+  if (markdownParser) {
+    const spoilers = [];
+    const prepared = String(source || "")
+      .replace(/--([^-|\n]+?)--/g, "~~$1~~")
+      .replace(/\|\|([\s\S]*?)\|\|/g, (_, content) => {
+        const id = spoilers.push(content) - 1;
+        return `LCSP${id}END`;
+      });
+    const renderer = new window.marked.Renderer();
+    renderer.code = ({ text, lang }) => codeBlockHtml(text, lang || "");
+    const rendered = markdownParser.parse(prepared, { renderer, gfm: true, breaks: true });
+    const safe = sanitizeMarkdown
+      ? sanitizeMarkdown(rendered, { ADD_ATTR: ["target", "rel", "data-code-id", "data-spoiler", "tabindex"], FORBID_TAGS: ["style", "script", "iframe", "object", "embed"] })
+      : rendered;
+    return safe.replace(/LCSP(\d+)END/g, (_, id) => `<span class="spoiler" tabindex="0" role="button" data-spoiler>${renderInlineMarkdown(spoilers[Number(id)] || "")}</span>`);
+  }
   const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
   const html = [];
   let index = 0;
@@ -708,7 +832,7 @@ function chatHtml() {
   const messages = state.messages.length
     ? state.messages.map((message) => `<div class="chat-message ${message.senderId === state.sessionId ? "local" : ""}"><div class="message-meta"><strong>${escapeHtml(message.name)}</strong><span>${escapeHtml(message.time)}</span></div><div class="markdown-body">${renderMarkdown(message.text)}</div></div>`).join("")
     : `<div class="chat-empty">${icon("chat", 26)}<p>Chưa có tin nhắn nào.</p><span>Bắt đầu cuộc trò chuyện trong phòng duy nhất này.</span></div>`;
-  return `<aside class="chat-panel" aria-label="Trò chuyện trong phòng"><div class="panel-head"><div><span class="panel-kicker">PHÒNG CHAT</span><h2>Tin nhắn</h2></div><button class="icon-button subtle" id="close-chat" aria-label="Đóng chat">${icon("close", 19)}</button></div><div class="chat-list">${messages}</div><form class="chat-compose" id="chat-form"><textarea id="chat-input" rows="2" placeholder="Markdown được hỗ trợ..." aria-label="Tin nhắn">${escapeHtml(state.draft)}</textarea><button type="submit" aria-label="Gửi tin nhắn" ${state.draft.trim() ? "" : "disabled"}>${icon("send", 18)}</button></form></aside>`;
+  return `<aside class="chat-panel" aria-label="Trò chuyện trong phòng"><div class="panel-head"><div><span class="panel-kicker">PHÒNG CHAT</span><h2>Tin nhắn</h2></div><button class="icon-button subtle" id="close-chat" aria-label="Đóng chat">${icon("close", 19)}</button></div><div class="chat-list">${messages}</div><form class="chat-compose" id="chat-form"><textarea id="chat-input" rows="2" placeholder="Nhập tin nhắn" aria-label="Tin nhắn">${escapeHtml(state.draft)}</textarea><button type="submit" aria-label="Gửi tin nhắn" ${state.draft.trim() ? "" : "disabled"}>${icon("send", 18)}</button></form></aside>`;
 }
 
 function shareTileHtml() {
@@ -723,7 +847,7 @@ function roomHtml() {
     </main><footer class="control-dock"><div class="dock-user">${avatarHtml()}<div><strong>${escapeHtml(state.displayName)}</strong><span>Trong phòng</span></div></div><div class="controls">
        <button class="control-button ${state.micOn ? "" : "off"}" id="toggle-mic" aria-label="${state.micOn ? "Tắt microphone" : "Bật microphone"}">${icon(state.micOn ? "mic" : "micOff", 21)}</button>
       <button class="control-button ${state.cameraOn ? "" : "off"}" id="toggle-camera" aria-label="${state.cameraOn ? "Tắt camera" : "Bật camera"}">${icon("camera", 21)}</button>
-      <button class="control-button mobile-only" id="switch-camera" aria-label="Đổi camera trước sau">${icon("switch", 21)}</button>
+       <button class="control-button" id="switch-camera" aria-label="Đổi camera trước sau">${icon("switch", 21)}</button>
       <button class="control-button ${state.shareStream ? "active" : ""}" id="toggle-share" aria-label="${state.shareStream ? "Dừng chia sẻ màn hình" : "Chia sẻ màn hình"}">${icon("share", 21)}</button>
       <button class="control-button ${state.chatOpen ? "active" : ""}" id="toggle-chat" aria-label="Mở chat">${icon("chat", 21)}${state.messages.length ? `<b class="unread-count">${state.messages.length}</b>` : ""}</button>
       <button class="control-button" id="open-mobile-settings" aria-label="Mở cài đặt media">${icon("settings", 21)}</button>
@@ -761,7 +885,12 @@ function bindVideos() {
   });
   document.querySelectorAll("[data-audio]").forEach((audio) => {
     const stream = remoteStreams.get(audio.dataset.audio);
-    if (stream) audio.srcObject = stream;
+    if (stream) {
+      audio.srcObject = stream;
+      audio.autoplay = true;
+      audio.volume = 1;
+      audio.play().catch(() => undefined);
+    }
   });
 }
 
@@ -872,6 +1001,16 @@ function bindRoom() {
       }
     });
   });
+  document.querySelectorAll("[data-spoiler]").forEach((spoiler) => {
+    const reveal = () => spoiler.classList.toggle("revealed");
+    spoiler.addEventListener("click", reveal);
+    spoiler.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        reveal();
+      }
+    });
+  });
   document.querySelector("#apply-quality")?.addEventListener("click", () => { applyQuality(); closeQuality(); });
 }
 
@@ -895,6 +1034,7 @@ function updateRoom() {
 }
 
 function leaveRoom() {
+  playPresenceSound("leave");
   api("/api/room/leave", { sessionId: state.sessionId }, true).catch(() => undefined);
   eventsSource?.close();
   eventsSource = null;
@@ -934,6 +1074,8 @@ function errorPageHtml(code, title, message) {
 
 window.addEventListener("offline", () => { state.offline = true; render(); });
 window.addEventListener("online", async () => { state.offline = false; render(); if (state.joined) await rejoinRoom(); });
+document.addEventListener("pointerdown", unlockPresenceAudio, { once: true });
+document.addEventListener("keydown", unlockPresenceAudio, { once: true });
 document.addEventListener("contextmenu", (event) => event.preventDefault());
 document.addEventListener("selectstart", (event) => { if (!["INPUT", "TEXTAREA"].includes(event.target.tagName)) event.preventDefault(); });
 document.addEventListener("copy", (event) => {
