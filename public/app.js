@@ -1,4 +1,5 @@
 const app = document.querySelector("#app");
+const hljs = window.hljs;
 
 const state = {
   joined: false,
@@ -25,6 +26,10 @@ const state = {
   draft: "",
   messages: [],
   remoteParticipants: [],
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+  ],
   toast: "",
   speaking: false,
   offline: !navigator.onLine,
@@ -35,12 +40,22 @@ let toastTimer = null;
 let audioMonitor = null;
 let speakingTimer = null;
 let eventsSource = null;
+const peerConnections = new Map();
+const remoteStreams = new Map();
+const presenceAudio = new Map(
+  ["join", "leave", "notification"].map((kind) => {
+    const audio = new Audio(`/sounds/${kind}.mp3`);
+    audio.preload = "auto";
+    return [kind, audio];
+  }),
+);
 
 const heights = { "120p": 120, "240p": 240, "360p": 360, "480p": 480, "720p": 720, "1080p": 1080 };
 
 function icon(name, size = 20) {
   const paths = {
     mic: '<rect x="8" y="2" width="8" height="13" rx="4"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4M8 22h8"/>',
+    micOff: '<rect x="8" y="2" width="8" height="13" rx="4"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4M8 22h8M4 4l16 16"/>',
     camera: '<path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h8A2.5 2.5 0 0 1 16 8.5v7a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 3 15.5z"/><path d="m16 11 5-3v8l-5-3"/>',
     share: '<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3M8 11h8M12 7v8M9 10l3-3 3 3"/>',
     leave: '<path d="M8 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3M15 16l4-4-4-4M19 12H8"/>',
@@ -106,8 +121,10 @@ function api(path, body, keepalive = false) {
 
 function playPresenceSound(kind) {
   if (!state.sounds[kind]) return;
-  const audio = new Audio(`/sounds/${kind}.mp3`);
+  const audio = presenceAudio.get(kind);
+  if (!audio) return;
   audio.volume = 0.55;
+  audio.currentTime = 0;
   audio.play().catch(() => undefined);
 }
 
@@ -126,20 +143,141 @@ function syncMediaState() {
   }).catch(() => undefined);
 }
 
+function signalPeer(targetId, type, payload) {
+  return api("/api/signal", {
+    sessionId: state.sessionId,
+    targetId,
+    type,
+    payload,
+  }).catch(() => undefined);
+}
+
+function desiredTracks() {
+  return [
+    ...(state.stream?.getTracks() || []),
+    ...(state.shareStream?.getTracks() || []),
+  ];
+}
+
+function syncPeerTracks(peer) {
+  const tracks = desiredTracks();
+  const senders = peer.pc.getSenders();
+  for (const sender of senders) {
+    if (sender.track && !tracks.includes(sender.track)) peer.pc.removeTrack(sender);
+  }
+  for (const track of tracks) {
+    if (!senders.some((sender) => sender.track === track)) {
+      peer.pc.addTrack(track, new MediaStream([track]));
+    }
+  }
+}
+
+function closePeer(remoteId) {
+  const peer = peerConnections.get(remoteId);
+  if (!peer) return;
+  peer.pc.ontrack = null;
+  peer.pc.onicecandidate = null;
+  peer.pc.close();
+  peerConnections.delete(remoteId);
+  remoteStreams.delete(remoteId);
+}
+
+function createPeer(remoteId) {
+  if (remoteId === state.sessionId || !window.RTCPeerConnection) return null;
+  const existing = peerConnections.get(remoteId);
+  if (existing) {
+    syncPeerTracks(existing);
+    return existing;
+  }
+  const pc = new RTCPeerConnection({ iceServers: state.iceServers });
+  const peer = {
+    pc,
+    makingOffer: false,
+    ignoreOffer: false,
+    polite: state.sessionId > remoteId,
+    pendingCandidates: [],
+  };
+  peerConnections.set(remoteId, peer);
+  pc.onicecandidate = (event) => {
+    if (event.candidate) signalPeer(remoteId, "candidate", event.candidate);
+  };
+  pc.ontrack = (event) => {
+    const stream = event.streams[0] || remoteStreams.get(remoteId) || new MediaStream();
+    if (!event.streams[0]) stream.addTrack(event.track);
+    remoteStreams.set(remoteId, stream);
+    updateRoom();
+  };
+  pc.onconnectionstatechange = () => {
+    if (["failed", "closed"].includes(pc.connectionState)) {
+      closePeer(remoteId);
+      updateRoom();
+    }
+  };
+  pc.onnegotiationneeded = async () => {
+    try {
+      peer.makingOffer = true;
+      await pc.setLocalDescription();
+      if (pc.localDescription) {
+        await signalPeer(remoteId, pc.localDescription.type, pc.localDescription);
+      }
+    } catch {
+      return;
+    } finally {
+      peer.makingOffer = false;
+    }
+  };
+  syncPeerTracks(peer);
+  return peer;
+}
+
+async function handleRtcSignal(event) {
+  const { fromId, type, payload } = JSON.parse(event.data);
+  const peer = createPeer(fromId);
+  if (!peer) return;
+  const description = type === "candidate" ? null : payload;
+  try {
+    if (description) {
+      const offerCollision =
+        description.type === "offer" &&
+        (peer.makingOffer || peer.pc.signalingState !== "stable");
+      peer.ignoreOffer = !peer.polite && offerCollision;
+      if (peer.ignoreOffer) return;
+      await peer.pc.setRemoteDescription(description);
+      for (const candidate of peer.pendingCandidates.splice(0)) {
+        await peer.pc.addIceCandidate(candidate);
+      }
+      if (description.type === "offer") {
+        await peer.pc.setLocalDescription();
+        if (peer.pc.localDescription) {
+          await signalPeer(fromId, peer.pc.localDescription.type, peer.pc.localDescription);
+        }
+      }
+    } else if (payload) {
+      if (peer.pc.remoteDescription) await peer.pc.addIceCandidate(payload);
+      else peer.pendingCandidates.push(payload);
+    }
+  } catch {
+    peer.ignoreOffer = false;
+  }
+}
+
 function connectRoom() {
   eventsSource?.close();
   const source = new EventSource(`/api/events?sessionId=${encodeURIComponent(state.sessionId)}`);
   eventsSource = source;
   source.addEventListener("room-sync", (event) => {
     const data = JSON.parse(event.data);
+    state.iceServers = data.iceServers || state.iceServers;
     state.remoteParticipants = data.participants.filter((participant) => participant.id !== state.sessionId);
     state.messages = data.messages || [];
+    state.remoteParticipants.forEach((participant) => createPeer(participant.id));
     updateRoom();
   });
   source.addEventListener("participant-joined", (event) => {
     const participant = JSON.parse(event.data);
     if (participant.id === state.sessionId) return;
     state.remoteParticipants = [...state.remoteParticipants.filter((item) => item.id !== participant.id), participant];
+    createPeer(participant.id);
     playPresenceSound("join");
     updateRoom();
   });
@@ -147,11 +285,13 @@ function connectRoom() {
     const participant = JSON.parse(event.data);
     if (participant.id === state.sessionId) return;
     state.remoteParticipants = [...state.remoteParticipants.filter((item) => item.id !== participant.id), participant];
+    createPeer(participant.id);
     updateRoom();
   });
   source.addEventListener("participant-left", (event) => {
     const participant = JSON.parse(event.data);
     state.remoteParticipants = state.remoteParticipants.filter((item) => item.id !== participant.id);
+    closePeer(participant.id);
     playPresenceSound("leave");
     updateRoom();
   });
@@ -161,6 +301,7 @@ function connectRoom() {
     playPresenceSound("notification");
     updateRoom();
   });
+  source.addEventListener("rtc-signal", handleRtcSignal);
   source.onerror = () => {
     if (!navigator.onLine) { state.offline = true; render(); }
     else if (state.joined) window.setTimeout(rejoinRoom, 1200);
@@ -173,10 +314,12 @@ async function rejoinRoom() {
     const joined = await api("/api/room/join", { sessionId: state.sessionId, name: state.displayName, hasAvatar: Boolean(state.avatarUrl) });
       state.remoteParticipants = joined.participants.filter((participant) => participant.id !== state.sessionId);
     state.messages = joined.messages || state.messages;
+    state.iceServers = joined.iceServers || state.iceServers;
     connectRoom();
     syncMediaState();
+    state.remoteParticipants.forEach((participant) => createPeer(participant.id));
     updateRoom();
-  } catch { /* EventSource will retry while the browser is still online. */ }
+  } catch {}
 }
 
 function stopAudioMonitor() {
@@ -251,6 +394,10 @@ async function ensureMedia(activate = false, showQuality = false) {
       mediaPromise = null;
       updateRoom();
       syncMediaState();
+      state.remoteParticipants.forEach((participant) => {
+        const peer = createPeer(participant.id);
+        if (peer) syncPeerTracks(peer);
+      });
       if (showQuality && !state.qualityPrompted) openQuality(true);
       if (state.micOn) startAudioMonitor();
       return stream;
@@ -292,6 +439,7 @@ async function switchCamera() {
       nextVideo.enabled = false;
     }
     state.facingMode = nextFacing;
+    peerConnections.forEach((peer) => syncPeerTracks(peer));
     updateRoom();
   } catch {
     showToast("Camera trước/sau không khả dụng trên thiết bị này.");
@@ -330,6 +478,7 @@ async function toggleShare() {
     stopStream(state.shareStream);
     state.shareStream = null;
     state.shareFocus = false;
+    peerConnections.forEach((peer) => syncPeerTracks(peer));
     syncMediaState();
     updateRoom();
     return;
@@ -337,8 +486,15 @@ async function toggleShare() {
   if (!navigator.mediaDevices?.getDisplayMedia) { showToast("Trình duyệt này không hỗ trợ chia sẻ màn hình."); return; }
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: { ...constraints() }, audio: false });
-    stream.getVideoTracks()[0].onended = () => { state.shareStream = null; state.shareFocus = false; syncMediaState(); updateRoom(); };
+    stream.getVideoTracks()[0].onended = () => {
+      state.shareStream = null;
+      state.shareFocus = false;
+      peerConnections.forEach((peer) => syncPeerTracks(peer));
+      syncMediaState();
+      updateRoom();
+    };
     state.shareStream = stream;
+    peerConnections.forEach((peer) => syncPeerTracks(peer));
     if (!state.qualityPrompted) openQuality(true);
     syncMediaState();
     updateRoom();
@@ -385,17 +541,20 @@ function participantTileHtml() {
   const cameraVisible = state.cameraOn && state.stream?.getVideoTracks().some((track) => track.enabled);
   return `<article class="participant-tile ${state.speaking ? "is-speaking" : ""}" id="local-tile">
     ${cameraVisible ? videoHtml("local") : `<div class="avatar-stage">${avatarHtml(true)}</div>`}
-    <div class="tile-shade"></div><div class="tile-topline"><span class="local-pill">BẠN</span>${!state.micOn ? `<span class="tile-muted">${icon("mic", 13)}</span>` : ""}</div>
+     <div class="tile-shade"></div><div class="tile-topline"><span class="local-pill">BẠN</span>${!state.micOn ? `<span class="tile-muted">${icon("micOff", 13)}</span>` : ""}</div>
     <div class="tile-label"><span>${escapeHtml(state.displayName)}</span>${cameraVisible ? '<span class="camera-live-dot"></span>' : ""}</div>
   </article>`;
 }
 
 function remoteParticipantTileHtml(participant) {
-  const micStatus = participant.micOn ? `<span class="media-status live" title="Microphone đang bật">${icon("mic", 13)}</span>` : `<span class="media-status muted" title="Microphone đang tắt">${icon("mic", 13)}</span>`;
+  const micStatus = participant.micOn ? `<span class="media-status live" title="Microphone đang bật">${icon("mic", 13)}</span>` : `<span class="media-status muted" title="Microphone đang tắt">${icon("micOff", 13)}</span>`;
   const cameraStatus = participant.cameraOn ? `<span class="media-status live" title="Camera đang bật">${icon("camera", 13)}</span>` : "";
   const shareStatus = participant.sharing ? `<span class="media-status live" title="Đang chia sẻ màn hình">${icon("share", 13)}</span>` : "";
-  return `<article class="participant-tile" data-participant-id="${escapeHtml(participant.id)}">
-    <div class="avatar-stage"><div class="participant-avatar participant-avatar-large" style="background:#5865f2"><span>${escapeHtml(participant.initials || initials(participant.name))}</span></div></div>
+  const remoteStream = remoteStreams.get(participant.id);
+  const cameraVisible = participant.cameraOn && remoteStream?.getVideoTracks().length;
+  return `<article class="participant-tile remote-tile ${participant.cameraOn ? "camera-ready" : "camera-off"}" data-participant-id="${escapeHtml(participant.id)}" data-camera="${participant.cameraOn ? "on" : "off"}">
+     ${cameraVisible ? videoHtml(`remote:${participant.id}`) : `<div class="avatar-stage"><div class="participant-avatar participant-avatar-large" style="background:#5865f2"><span>${escapeHtml(participant.initials || initials(participant.name))}</span></div></div>`}
+     <audio class="remote-audio" data-audio="${escapeHtml(participant.id)}" autoplay></audio>
     <div class="tile-shade"></div><div class="tile-topline"><span class="local-pill" style="background:#404249">ĐANG TRONG PHÒNG</span><div class="media-statuses">${micStatus}${cameraStatus}${shareStatus}</div></div>
     <div class="tile-label"><span>${escapeHtml(participant.name)}</span>${participant.cameraOn ? '<span class="camera-live-dot"></span>' : ""}</div>
   </article>`;
@@ -446,11 +605,35 @@ function highlightCode(code, language) {
   return output + escapeHtml(code.slice(cursor));
 }
 
+const languageAliases = { js: "javascript", jsx: "javascript", ts: "typescript", tsx: "typescript", py: "python", rb: "ruby", rs: "rust", cs: "csharp", html: "xml", sh: "bash", shell: "bash", yml: "yaml", md: "markdown" };
+
+function normalizeLanguage(language) {
+  const value = String(language || "").toLowerCase().trim();
+  return languageAliases[value] || value;
+}
+
+function detectedCodeLanguage(code, language) {
+  const normalized = normalizeLanguage(language);
+  if (normalized && hljs?.getLanguage(normalized)) return normalized;
+  if (/^\s*print\s*\(/m.test(code) && !/[{};]/.test(code)) return "python";
+  return hljs?.highlightAuto(code).language || "text";
+}
+
+function highlightCodeWithLibrary(code, language) {
+  const normalized = detectedCodeLanguage(code, language);
+  if (!hljs || normalized === "text" || !hljs.getLanguage(normalized)) return highlightCode(code, language);
+  try {
+    return hljs.highlight(code, { language: normalized, ignoreIllegals: true }).value;
+  } catch {
+    return escapeHtml(code);
+  }
+}
+
 function codeBlockHtml(code, language) {
   const id = `code-${nextCodeBlockId++}`;
   markdownCodeBlocks.set(id, code);
-  const label = language || "text";
-  return `<div class="code-block"><div class="code-toolbar"><span class="code-language">${escapeHtml(label)}</span><button type="button" class="code-copy" data-code-id="${id}">${icon("copy", 14)}<span>Copy</span></button></div><pre><code class="language-${escapeHtml(label)}">${highlightCode(code, label)}</code></pre></div>`;
+  const label = detectedCodeLanguage(code, language);
+  return `<div class="code-block"><div class="code-toolbar"><span class="code-language">${escapeHtml(label)}</span><button type="button" class="code-copy" data-code-id="${id}">${icon("copy", 14)}<span>Copy</span></button></div><pre><code class="hljs language-${escapeHtml(label)}">${highlightCodeWithLibrary(code, label)}</code></pre></div>`;
 }
 
 function renderInlineMarkdown(value) {
@@ -538,7 +721,7 @@ function roomHtml() {
     <main class="room-main"><div class="room-heading"><div><span class="panel-kicker">KÊNH THOẠI</span><h1>Phòng chính</h1></div><div class="room-heading-actions"><span>${icon("users", 15)} ${state.remoteParticipants.length + 1} người</span><span class="quality-chip">${state.resolution} · ${state.fps} fps</span></div></div>
       <div class="room-layout"><section class="stage"><div class="stage-bar"><span>CUỘC GỌI NHÓM</span><span class="stage-hint">Một phòng duy nhất · kết nối trong trình duyệt</span></div><div class="participant-grid">${participantTileHtml()}${state.remoteParticipants.map(remoteParticipantTileHtml).join("")}${shareTileHtml()}</div></section>${state.chatOpen ? chatHtml() : ""}</div>
     </main><footer class="control-dock"><div class="dock-user">${avatarHtml()}<div><strong>${escapeHtml(state.displayName)}</strong><span>Trong phòng</span></div></div><div class="controls">
-      <button class="control-button ${state.micOn ? "" : "off"}" id="toggle-mic" aria-label="${state.micOn ? "Tắt microphone" : "Bật microphone"}">${icon("mic", 21)}</button>
+       <button class="control-button ${state.micOn ? "" : "off"}" id="toggle-mic" aria-label="${state.micOn ? "Tắt microphone" : "Bật microphone"}">${icon(state.micOn ? "mic" : "micOff", 21)}</button>
       <button class="control-button ${state.cameraOn ? "" : "off"}" id="toggle-camera" aria-label="${state.cameraOn ? "Tắt camera" : "Bật camera"}">${icon("camera", 21)}</button>
       <button class="control-button mobile-only" id="switch-camera" aria-label="Đổi camera trước sau">${icon("switch", 21)}</button>
       <button class="control-button ${state.shareStream ? "active" : ""}" id="toggle-share" aria-label="${state.shareStream ? "Dừng chia sẻ màn hình" : "Chia sẻ màn hình"}">${icon("share", 21)}</button>
@@ -564,11 +747,21 @@ function shareFocusHtml() {
 function bindVideos() {
   document.querySelectorAll("[data-video]").forEach((video) => {
     const kind = video.dataset.video;
-    const stream = kind === "local" ? state.stream : state.shareStream;
+    const stream = kind === "local"
+      ? state.stream
+      : kind === "share" || kind === "share-focus"
+        ? state.shareStream
+        : kind?.startsWith("remote:")
+          ? remoteStreams.get(kind.slice(7))
+          : null;
     if (stream) {
       video.srcObject = stream;
       video.play().catch(() => undefined);
     }
+  });
+  document.querySelectorAll("[data-audio]").forEach((audio) => {
+    const stream = remoteStreams.get(audio.dataset.audio);
+    if (stream) audio.srcObject = stream;
   });
 }
 
@@ -608,6 +801,7 @@ async function joinRoom(asGuest) {
     return;
   }
   await ensureMedia(false, false);
+  state.remoteParticipants.forEach((participant) => createPeer(participant.id));
 }
 
 function bindRoom() {
@@ -636,7 +830,20 @@ function bindRoom() {
       updateRoom();
     }).catch(() => showToast("Không thể gửi tin nhắn khi đang offline."));
   });
-  document.querySelector("#chat-input")?.addEventListener("input", (event) => { state.draft = event.target.value; });
+  document.querySelector("#chat-input")?.addEventListener("input", (event) => {
+    const input = event.target;
+    const sendButton = document.querySelector("#chat-form button[type=\"submit\"]");
+    state.draft = input.value;
+    if (sendButton) sendButton.disabled = !state.draft.trim();
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
+  });
+  document.querySelector("#chat-input")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      document.querySelector("#chat-form")?.requestSubmit();
+    }
+  });
   document.querySelector("#close-quality")?.addEventListener("click", closeQuality);
   document.querySelector("#resolution")?.addEventListener("change", (event) => { state.resolution = event.target.value; render(); });
   document.querySelector("#fps")?.addEventListener("change", (event) => { state.fps = event.target.value; render(); });
@@ -691,6 +898,9 @@ function leaveRoom() {
   api("/api/room/leave", { sessionId: state.sessionId }, true).catch(() => undefined);
   eventsSource?.close();
   eventsSource = null;
+  peerConnections.forEach((peer) => peer.pc.close());
+  peerConnections.clear();
+  remoteStreams.clear();
   stopStream(state.stream);
   stopStream(state.shareStream);
   stopAudioMonitor();

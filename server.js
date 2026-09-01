@@ -17,6 +17,10 @@ const mimeTypes = {
 const participants = new Map();
 const clients = new Map();
 const messages = [];
+const iceServers = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun.cloudflare.com:3478" },
+];
 
 function sendJson(response, status, body) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -91,7 +95,7 @@ async function handleApi(request, response, path) {
       };
       participants.set(sessionId, participant);
       broadcast("participant-joined", participant, sessionId);
-      sendJson(response, 200, { ok: true, roomId: "main", participant, participants: participantList(), messages });
+      sendJson(response, 200, { ok: true, roomId: "main", participant, participants: participantList(), messages, iceServers });
     } catch { sendJson(response, 400, { ok: false, error: "Không thể tham gia phòng." }); }
     return true;
   }
@@ -106,7 +110,7 @@ async function handleApi(request, response, path) {
       "X-Accel-Buffering": "no",
     });
     clients.set(sessionId, response);
-    writeEvent(response, "room-sync", { roomId: "main", participants: participantList(), messages });
+    writeEvent(response, "room-sync", { roomId: "main", participants: participantList(), messages, iceServers });
     const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 20_000);
     request.on("close", () => {
       clearInterval(heartbeat);
@@ -117,6 +121,27 @@ async function handleApi(request, response, path) {
         if (participant) broadcast("participant-left", participant);
       }
     });
+    return true;
+  }
+
+  if (path === "/api/signal" && request.method === "POST") {
+    try {
+      const body = await readBody(request);
+      const senderId = String(body.sessionId || "").slice(0, 100);
+      const targetId = String(body.targetId || "").slice(0, 100);
+      const type = body.type;
+      if (!participants.has(senderId) || !participants.has(targetId)) {
+        sendJson(response, 404, { ok: false, error: "Người tham gia không còn trong phòng." });
+        return true;
+      }
+      if (!["offer", "answer", "candidate"].includes(type)) {
+        sendJson(response, 400, { ok: false, error: "Loại tín hiệu không hợp lệ." });
+        return true;
+      }
+      const target = clients.get(targetId);
+      if (target) writeEvent(target, "rtc-signal", { fromId: senderId, type, payload: body.payload });
+      sendJson(response, 200, { ok: true });
+    } catch { sendJson(response, 400, { ok: false, error: "Không thể chuyển tín hiệu WebRTC." }); }
     return true;
   }
 
