@@ -9,6 +9,7 @@ const mimeTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
+  ".mp3": "audio/mpeg",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
 };
@@ -78,7 +79,16 @@ async function handleApi(request, response, path) {
       const name = String(body.name || "").trim().slice(0, 80);
       if (!sessionId || !name) { sendJson(response, 400, { ok: false, error: "Tên và phiên đăng nhập là bắt buộc." }); return true; }
       removeParticipant(sessionId, false);
-      const participant = { id: sessionId, name, initials: name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(), hasAvatar: Boolean(body.hasAvatar), joinedAt: Date.now() };
+      const participant = {
+        id: sessionId,
+        name,
+        initials: name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(),
+        hasAvatar: Boolean(body.hasAvatar),
+        micOn: false,
+        cameraOn: false,
+        sharing: false,
+        joinedAt: Date.now(),
+      };
       participants.set(sessionId, participant);
       broadcast("participant-joined", participant, sessionId);
       sendJson(response, 200, { ok: true, roomId: "main", participant, participants: participantList(), messages });
@@ -123,6 +133,21 @@ async function handleApi(request, response, path) {
       broadcast("chat-message", message);
       sendJson(response, 200, { ok: true, message });
     } catch { sendJson(response, 400, { ok: false, error: "Không thể gửi tin nhắn." }); }
+    return true;
+  }
+
+  if (path === "/api/room/media" && request.method === "POST") {
+    try {
+      const body = await readBody(request);
+      const sessionId = String(body.sessionId || "");
+      const participant = participants.get(sessionId);
+      if (!participant) { sendJson(response, 404, { ok: false, error: "Phiên không tồn tại." }); return true; }
+      participant.micOn = Boolean(body.micOn);
+      participant.cameraOn = Boolean(body.cameraOn);
+      participant.sharing = Boolean(body.sharing);
+      broadcast("participant-updated", participant);
+      sendJson(response, 200, { ok: true, participant });
+    } catch { sendJson(response, 400, { ok: false, error: "Không thể cập nhật trạng thái media." }); }
     return true;
   }
 
